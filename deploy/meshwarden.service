@@ -1,0 +1,18 @@
+# systemd user service: ~/.config/systemd/user/meshwarden.service
+# enable with: systemctl --user daemon-reload && systemctl --user enable --now meshwarden
+#              loginctl enable-linger $USER   (keeps it running without a login session)
+[Unit]
+Description=MeshWarden - read-only MeshCore DM bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/meshwarden
+Environment=PYTHONPATH=%h/meshwarden/lib
+EnvironmentFile=%h/meshwarden/meshwarden.env
+ExecStart=/usr/bin/python3 -u %h/meshwarden/meshwarden.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target

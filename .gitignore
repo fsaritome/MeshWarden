@@ -1,0 +1,11 @@
+# secrets and local config - never commit
+*.env
+!*.env.example
+secrets.env
+# vendored libraries / runtime
+lib/
+__pycache__/
+*.pyc
+*.log
+*.bak*
+.venv/
