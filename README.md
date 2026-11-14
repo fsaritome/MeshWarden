@@ -72,8 +72,31 @@ Checked every 60 s; a problem must persist **5 minutes** before you get a DM, an
 - Prometheus targets down, Prometheus unreachable, internet down
 - NAS pool degraded / NAS API unreachable, Home Assistant unreachable (if configured)
 - inverter switched ON/OFF
+- solar exporter down (no battery data)
+- optional: alerts from an external source (see below)
 
 At `SUMMARY_AT` (default 07:00) you get the night's minimum battery voltage plus `solar` and `status`.
+
+## External alert source (optional)
+
+If something else in your house already decides what is an alert (a monitoring panel, a script, an
+alert manager), MeshWarden can be its LoRa channel. Set `ALERTS_URL` to a JSON endpoint on your LAN:
+
+```json
+{"open": [{"key": "dns:resolver", "level": "outage", "title": "DNS not answering", "ack": false},
+          {"key": "pool-fill:tank", "level": "warning", "title": "Pool tank 91% full"}]}
+```
+
+- Every 60 s MeshWarden reads it and DMs **new** alerts whose `level` is in `ALERTS_SEND`
+  (default `outage,critical`) as `ALERT ...`, and `OK again: ...` when they disappear. `key` identifies
+  an alert, `ack: true` silences it. The source should do its own debouncing: no extra hold is added.
+- Alerts already open when MeshWarden starts are taken as the baseline and not sent again.
+- Levels in `ALERTS_SUMMARY` (default `warning`) don't get a DM each; they go into the morning summary,
+  and `status` shows `Alerts N crit/M warn`.
+- While the source answers, MeshWarden's own "Prometheus targets down" and "internet down" checks pause
+  (the source covers them). If it can't be read for 5 minutes you get `ALERT Alert source unreachable`
+  and the own checks run again. Solar alerts, "Prometheus unreachable" and "Solar exporter DOWN" always run.
+- `ALERTS_DRYRUN=1` only logs what would be sent: try that first.
 
 ## Requirements
 

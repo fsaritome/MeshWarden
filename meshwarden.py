@@ -26,6 +26,11 @@ SUMMARY_AT = E("SUMMARY_AT", "07:00")  # local time, empty = off
 TZ = ZoneInfo(E("BOT_TZ", "Europe/Berlin"))
 COOLDOWN_S, MAX_LEN, MAX_PARTS = float(E("COOLDOWN_S", "3")), 140, 3
 RATE_PER_MIN, QUEUE_MAX = int(E("RATE_PER_MIN", "10")), 5
+# optional external alert source (JSON, see README "External alert source")
+ALERTS_URL = E("ALERTS_URL", "").rstrip("/")
+ALERTS_SEND = {x.strip().lower() for x in E("ALERTS_SEND", "outage,critical").split(",") if x.strip()}
+ALERTS_SUMMARY = {x.strip().lower() for x in E("ALERTS_SUMMARY", "warning").split(",") if x.strip()}
+ALERTS_DRYRUN = E("ALERTS_DRYRUN", "") == "1"
 
 logging.basicConfig(level=E("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("meshwarden")
@@ -121,6 +126,22 @@ def cmd_net():
     return gw_txt + f"Inet {'OK' if inet else 'DOWN'} | DNS {'OK' if dns else 'FAIL'} | Web {'%.0fms' % rtt if web else 'FAIL'}"
 
 
+def ext_alerts():
+    """The external alert source's answer ({"open": [{key, level, title, ack}, ...]}), or None."""
+    if not ALERTS_URL:
+        return None
+    try:
+        d = http_json(ALERTS_URL, timeout=8)
+        return d if isinstance(d.get("open"), list) else None
+    except Exception as e:
+        log.info("alert source not read: %r", e)
+        return None
+
+
+def ext_open(d, levels):
+    return [a for a in (d or {}).get("open", []) if str(a.get("level", "")).lower() in levels and not a.get("ack")]
+
+
 def cmd_status():
     p = urllib.parse.urlparse(PROM_URL)
     prom_ok = tcp_ok(p.hostname, p.port or 80)
@@ -132,6 +153,9 @@ def cmd_status():
         out += f" | HA {f(tcp_ok(*_hostport(HA_URL)))}"
     if NAS_URL:
         out += f" | NAS {f(tcp_ok(*_hostport(NAS_URL)))}"
+    if ALERTS_URL:
+        d = ext_alerts()
+        out += f" | Alerts {len(ext_open(d, ALERTS_SEND))} crit/{len(ext_open(d, ALERTS_SUMMARY))} warn" if d else " | Alerts DOWN"
     return out
 
 
@@ -237,6 +261,8 @@ class Bot:
         self.pending: dict[str, float] = {}
         self.last_summary_day = None
         self.inverter_on = None
+        self.ext = None           # last answer of ALERTS_URL (None = not configured / not reachable)
+        self.ext_seen = None      # {key: title} already reported; None = no baseline yet
 
     async def send(self, prefix: str, text: str):
         mc = self.mc
@@ -332,6 +358,9 @@ class Bot:
     def _checks(self) -> dict:
         """returns {alert_name: (is_bad, message)}"""
         out = {}
+        self.ext = ext_alerts()
+        if ALERTS_URL:
+            out["alert_source"] = (self.ext is None, "Alert source unreachable (own checks active)")
         try:
             v = prom1(f'battery_voltage{{job="{PROM_JOB}"}}')
             if v is not None:
@@ -344,13 +373,16 @@ class Bot:
             inv = prom1(f'inverter_status{{job="{PROM_JOB}"}}')
             if inv is not None:
                 out["_inverter"] = (inv != 0, "")
-            down = [r["metric"].get("job", "?") for r in prom("up") if r["value"][1] == "0"]
-            out["targets_down"] = (bool(down), "Down: " + ", ".join(down))
+            out["solar_down"] = (prom1(f'up{{job="{PROM_JOB}"}}') == 0, "Solar exporter DOWN (no battery data)")
+            if self.ext is None:  # an answering external source covers targets and internet
+                down = [r["metric"].get("job", "?") for r in prom("up") if r["value"][1] == "0"]
+                out["targets_down"] = (bool(down), "Down: " + ", ".join(down))
             out["prom"] = (False, "")
         except Exception:
             out["prom"] = (True, "Prometheus unreachable")
-        inet = tcp_ok("1.1.1.1", 53) or tcp_ok("8.8.8.8", 53)
-        out["internet"] = (not inet, "Internet DOWN")
+        if self.ext is None:
+            inet = tcp_ok("1.1.1.1", 53) or tcp_ok("8.8.8.8", 53)
+            out["internet"] = (not inet, "Internet DOWN")
         if NAS_URL and NAS_KEY:
             try:
                 bad = [p["name"] for p in _nas("pool") if not p.get("healthy", True) or p.get("status") not in ("ONLINE", None)]
@@ -386,10 +418,30 @@ class Bot:
                         if was:
                             self.alert_state[name] = False
                             await self.broadcast(f"OK again: {name.replace('_', ' ')}")
+                await self.ext_outages()
                 await self.maybe_summary()
             except Exception:
                 log.exception("alert loop")
             await asyncio.sleep(60)
+
+    async def ext_outages(self):
+        """DM new alerts of the external source (levels ALERTS_SEND) and their end. The source is expected
+        to debounce itself, so no extra hold. While it is unreachable nothing is cleared."""
+        if self.ext is None:
+            return
+        cur = {str(a.get("key") or a.get("title")): a.get("title") or a.get("key") for a in ext_open(self.ext, ALERTS_SEND)}
+        if self.ext_seen is None:  # first answer after start: baseline, nothing re-sent
+            self.ext_seen = cur
+            log.info("alert source baseline: %d open, not re-sent: %s", len(cur), list(cur.values()))
+            return
+        new = [t for k, t in cur.items() if k not in self.ext_seen]
+        gone = [t for k, t in self.ext_seen.items() if k not in cur]
+        self.ext_seen = cur
+        for text in (("ALERT " + "; ".join(new)) if new else None, ("OK again: " + "; ".join(gone)) if gone else None):
+            if text and ALERTS_DRYRUN:
+                log.warning("dry-run, would send: %s", text)
+            elif text:
+                await self.broadcast(text)
 
     async def maybe_summary(self):
         if not SUMMARY_AT:
@@ -404,6 +456,9 @@ class Bot:
                     parts.append(await asyncio.to_thread(f))
                 except Exception:
                     pass
+            warn = ext_open(self.ext, ALERTS_SUMMARY)  # lower levels: once a day instead of one DM each
+            if warn:
+                parts.append(f"Warn {len(warn)}: " + ", ".join(str(a.get("title", "?")) for a in warn[:4]))
             try:
                 vmin = await asyncio.to_thread(prom1, f'min_over_time(battery_voltage{{job="{PROM_JOB}"}}[10h])', 0)
                 parts.insert(0, f"Morning: night min {vmin:.2f}V")
@@ -430,9 +485,10 @@ class Bot:
             try:
                 self.mc = await MeshCore.create_tcp(NODE_HOST, NODE_PORT, auto_reconnect=True, max_reconnect_attempts=1000)
                 await self.mc.ensure_contacts()
-                log.info("connected to %s, allowed %s, alerts to %s, HA %s, NAS %s",
+                log.info("connected to %s, allowed %s, alerts to %s, HA %s, NAS %s, alert source %s%s",
                          self.mc.self_info.get("name"), ALLOWED, ALERT_KEYS,
-                         "on" if HA_TOKEN else "off", "on" if NAS_KEY else "off")
+                         "on" if HA_TOKEN else "off", "on" if NAS_KEY else "off", "on" if ALERTS_URL else "off",
+                         " (dry-run)" if ALERTS_DRYRUN else "")
                 self.mc.subscribe(EventType.CONTACT_MSG_RECV, self.handle)
                 await self.mc.start_auto_message_fetching()
                 fails = 0
